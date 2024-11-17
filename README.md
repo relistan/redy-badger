@@ -69,3 +69,33 @@ $ redis-cli
 127.0.0.1:6379> bf.exists bloom +4401483123445
 (integer) 1
 ```
+
+### Cuckoo filters
+```
+$ redis-cli
+127.0.0.1:6379> cf.insert cuckoo capacity 50000 error 0.1
+OK
+127.0.0.1:6379> cf.add cuckoo +13164647972
+OK
+127.0.0.1:6379> cf.add cuckoo +353873549906
+OK
+127.0.0.1:6379> cf.add cuckoo +4401483123445
+OK
+127.0.0.1:6379> cf.card cuckoo
+(integer) 3
+127.0.0.1:6379> cf.exists cuckoo +353873549906
+(integer) 1
+127.0.0.1:6379> cf.exists cuckoo +4401483123445
+(integer) 1
+127.0.0.1:6379> cf.exists cuckoo yomomma
+(integer) 0
+127.0.0.1:6379> cf.del cuckoo +353873549906
+(integer) 1
+127.0.0.1:6379> quit
+
+... persistence to disk ...
+
+$ redis-cli
+127.0.0.1:6379> cf.exists cuckoo +4401483123445
+(integer) 1
+```

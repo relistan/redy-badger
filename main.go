@@ -2,7 +2,6 @@ package main
 
 import (
 	"bytes"
-	"encoding/binary"
 	"flag"
 	"fmt"
 	"net"
@@ -32,12 +31,8 @@ func main() {
 	}
 }
 
-// bloomToBytes serializes a bloom.BloomFilter to a byte slice. We store
-// the capacity and error rate in the first 16 bytes of the byte slice.
-func bloomToBytes(filter *bloom.BloomFilter, capacity uint, errorRate float64) ([]byte, error) {
+func bloomToBytes(filter *bloom.BloomFilter) ([]byte, error) {
 	var blob bytes.Buffer
-	binary.Write(&blob, binary.LittleEndian, capacity)
-	binary.Write(&blob, binary.LittleEndian, errorRate)
 	_, err := filter.WriteTo(&blob)
 	if err != nil {
 		return nil, err
@@ -47,18 +42,13 @@ func bloomToBytes(filter *bloom.BloomFilter, capacity uint, errorRate float64) (
 
 // bloomFromBytes deserializes a bloom.BloomFilter from a byte slice including
 // the capacity and error rate.
-func bloomFromBytes(blob []byte) (*bloom.BloomFilter, uint, float64, error) {
-	var capacity uint
-	var errorRate float64
-	reader := bytes.NewReader(blob)
-	binary.Read(reader, binary.LittleEndian, &capacity)
-	binary.Read(reader, binary.LittleEndian, &errorRate)
-	filter := bloom.NewWithEstimates(capacity, errorRate)
-	_, err := filter.ReadFrom(reader)
+func bloomFromBytes(blob []byte) (*bloom.BloomFilter, error) {
+	var filter bloom.BloomFilter
+	_, err := filter.ReadFrom(bytes.NewReader(blob))
 	if err != nil {
-		return nil, 0, 0, err
+		return nil, err
 	}
-	return filter, capacity, errorRate, nil
+	return &filter, nil
 }
 
 // A RedisServer is a wrapper around a badger.DB that implements the
@@ -133,7 +123,7 @@ func (r *RedisServer) BfInsert(w resp.ResponseWriter, c *resp.Command) {
 
 	log.Infof("creating bloom filter with key %s capacity %d and error rate %f", c.Arg(0).String(), capacity, errorRate)
 	filter = bloom.NewWithEstimates(uint(capacity), errorRate)
-	blob, err := bloomToBytes(filter, uint(capacity), errorRate)
+	blob, err := bloomToBytes(filter)
 	if err != nil {
 		w.AppendError(err.Error())
 		return
@@ -155,12 +145,12 @@ func (r *RedisServer) BfAdd(w resp.ResponseWriter, c *resp.Command) {
 	}
 	var added bool
 	err := UpdateFunc(r.db, c.Arg(0).Bytes(), func(value []byte) ([]byte, error) {
-		filter, capacity, errRate, err := bloomFromBytes(value)
+		filter, err := bloomFromBytes(value)
 		if err != nil {
 			return nil, err
 		}
 		added = filter.TestOrAdd(c.Arg(1).Bytes())
-		result, err := bloomToBytes(filter, capacity, errRate)
+		result, err := bloomToBytes(filter)
 		if err != nil {
 			return nil, err
 		}
@@ -183,7 +173,7 @@ func (r *RedisServer) BfCard(w resp.ResponseWriter, c *resp.Command) {
 		return
 	}
 	value, err := Get(r.db, c.Arg(0).Bytes())
-	filter, _, _, err := bloomFromBytes(value)
+	filter, err := bloomFromBytes(value)
 	if err != nil {
 		w.AppendError(err.Error())
 		return
@@ -202,7 +192,7 @@ func (r *RedisServer) BfExists(w resp.ResponseWriter, c *resp.Command) {
 		return
 	}
 
-	filter, _, _, err := bloomFromBytes(value)
+	filter, err := bloomFromBytes(value)
 	if err != nil {
 		w.AppendError(err.Error())
 		return
@@ -218,7 +208,7 @@ func (r *RedisServer) BfExists(w resp.ResponseWriter, c *resp.Command) {
 // -------- CUCKOO FILTERS --------
 
 func (r *RedisServer) CfInsert(w resp.ResponseWriter, c *resp.Command) {
-	if c.ArgN() < 1 || c.ArgN() > 3 {
+	if c.ArgN() < 1 || c.ArgN() > 4 {
 		w.AppendError(redeo.WrongNumberOfArgs(c.Name))
 		return
 	}
@@ -234,6 +224,8 @@ func (r *RedisServer) CfInsert(w resp.ResponseWriter, c *resp.Command) {
 	case 2:
 		w.AppendError(redeo.WrongNumberOfArgs(c.Name))
 		return
+	case 4:
+		fallthrough // adds 'ITEMS' but no actual items
 	case 3: // cf.add key CAPACITY <capacity>
 		if c.Arg(1).String() != "capacity" && c.Arg(1).String() != "CAPACITY" {
 			w.AppendError(redeo.WrongNumberOfArgs(c.Name))
@@ -246,13 +238,17 @@ func (r *RedisServer) CfInsert(w resp.ResponseWriter, c *resp.Command) {
 		}
 	}
 
+	log.Infof("Creating cuckoo filter with key %s capacity %d",
+		c.Arg(0).String(), capacity,
+	)
 	filter = cuckoo.NewFilter(uint(capacity))
 	err = InsertExclusive(r.db, c.Arg(0).Bytes(), filter.Encode())
 	if err != nil {
 		w.AppendError(err.Error())
 		return
 	}
-	w.AppendOK()
+	w.AppendArrayLen(1)
+	w.AppendInt(1)
 }
 
 func (r *RedisServer) CfCard(w resp.ResponseWriter, c *resp.Command) {
@@ -267,6 +263,30 @@ func (r *RedisServer) CfCard(w resp.ResponseWriter, c *resp.Command) {
 		return
 	}
 	w.AppendInt(int64(filter.Count()))
+}
+
+func (r *RedisServer) CfDel(w resp.ResponseWriter, c *resp.Command) {
+	if c.ArgN() != 2 {
+		w.AppendError(redeo.WrongNumberOfArgs(c.Name))
+		return
+	}
+
+	var deleted bool
+	UpdateFunc(r.db, c.Arg(0).Bytes(), func(value []byte) ([]byte, error) {
+		filter, err := cuckoo.Decode(value)
+		if err != nil {
+			return nil, err
+		}
+		deleted = filter.Delete(c.Arg(1).Bytes())
+		return filter.Encode(), nil
+	})
+
+	if !deleted {
+		w.AppendInt(0)
+		return
+	}
+
+	w.AppendInt(1)
 }
 
 func (r *RedisServer) CfAdd(w resp.ResponseWriter, c *resp.Command) {
@@ -342,6 +362,7 @@ func run() error {
 	srv.HandleFunc("cf.insert", redisSrv.CfInsert)
 	srv.HandleFunc("cf.add", redisSrv.CfAdd)
 	srv.HandleFunc("cf.card", redisSrv.CfCard)
+	srv.HandleFunc("cf.del", redisSrv.CfDel)
 	srv.HandleFunc("cf.exists", redisSrv.CfExists)
 
 	srv.HandleFunc("del", func(w resp.ResponseWriter, c *resp.Command) {
